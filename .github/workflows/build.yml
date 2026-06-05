@@ -9,10 +9,11 @@ env:
   ANDROID_COMMON_BRANCH: android15-6.6
   ANDROID_MANIFEST_BRANCH: common-android15-6.6
   KERNEL_WORKSPACE: kernel-workspace
-  KERNEL_DIRECT_CLONE: kernel-common-direct
   DIST_DIR: out/dist
   ARTIFACT_DIR: artifacts
   SUKISU_SETUP_URL: https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/main/kernel/setup.sh
+  SUSFS_REPO: https://gitlab.com/simonpunk/susfs4ksu.git
+  SUSFS_BRANCH: gki-android15-6.6
 
 jobs:
   build-gki:
@@ -55,6 +56,7 @@ jobs:
             llvm \
             make \
             pahole \
+            patch \
             python-is-python3 \
             python3 \
             rsync \
@@ -66,7 +68,7 @@ jobs:
       - name: Fetch Android common kernel
         run: |
           set -Eeuo pipefail
-          mkdir -p "${KERNEL_WORKSPACE}" "${KERNEL_DIRECT_CLONE}"
+          mkdir -p "${KERNEL_WORKSPACE}"
 
           echo "Trying Android kernel manifest branch: ${ANDROID_MANIFEST_BRANCH}"
           curl -L --fail --show-error \
@@ -74,28 +76,16 @@ jobs:
             -o "${KERNEL_WORKSPACE}/repo"
           chmod +x "${KERNEL_WORKSPACE}/repo"
 
-          if (
-            cd "${KERNEL_WORKSPACE}"
-            ./repo init \
-              -u https://android.googlesource.com/kernel/manifest \
-              -b "${ANDROID_MANIFEST_BRANCH}" \
-              --depth=1
-            ./repo sync -c --no-tags --fail-fast -j"$(nproc)"
-          ); then
-            echo "KERNEL_SRC=${GITHUB_WORKSPACE}/${KERNEL_WORKSPACE}/common" >> "${GITHUB_ENV}"
-            echo "KERNEL_ROOT=${GITHUB_WORKSPACE}/${KERNEL_WORKSPACE}" >> "${GITHUB_ENV}"
-            echo "FETCH_MODE=repo manifest ${ANDROID_MANIFEST_BRANCH}" >> "${GITHUB_ENV}"
-          else
-            echo "::warning title=Manifest sync failed::Falling back to direct kernel/common clone."
-            git clone \
-              --depth=1 \
-              --branch "${ANDROID_COMMON_BRANCH}" \
-              https://android.googlesource.com/kernel/common \
-              "${KERNEL_DIRECT_CLONE}/common"
-            echo "KERNEL_SRC=${GITHUB_WORKSPACE}/${KERNEL_DIRECT_CLONE}/common" >> "${GITHUB_ENV}"
-            echo "KERNEL_ROOT=${GITHUB_WORKSPACE}/${KERNEL_DIRECT_CLONE}" >> "${GITHUB_ENV}"
-            echo "FETCH_MODE=direct git clone ${ANDROID_COMMON_BRANCH}" >> "${GITHUB_ENV}"
-          fi
+          cd "${KERNEL_WORKSPACE}"
+          ./repo init \
+            -u https://android.googlesource.com/kernel/manifest \
+            -b "${ANDROID_MANIFEST_BRANCH}" \
+            --depth=1
+          ./repo sync -c --no-tags --fail-fast -j"$(nproc)"
+
+          echo "KERNEL_SRC=${GITHUB_WORKSPACE}/${KERNEL_WORKSPACE}/common" >> "${GITHUB_ENV}"
+          echo "KERNEL_ROOT=${GITHUB_WORKSPACE}/${KERNEL_WORKSPACE}" >> "${GITHUB_ENV}"
+          echo "FETCH_MODE=repo manifest ${ANDROID_MANIFEST_BRANCH}" >> "${GITHUB_ENV}"
 
       - name: Inspect kernel tree before patch
         run: |
@@ -157,26 +147,89 @@ jobs:
           echo "Git status after SukiSU patch:"
           git status --short || true
 
+      - name: Integrate SUSFS for GKI android15-6.6
+        run: |
+          set -Eeuo pipefail
+          cd "${GITHUB_WORKSPACE}"
+
+          dump_susfs_tree() {
+            echo "susfs4ksu files, maxdepth 4:"
+            if [ -d susfs4ksu ]; then
+              find susfs4ksu -maxdepth 4 -type f | sort
+            else
+              echo "susfs4ksu directory does not exist"
+            fi
+          }
+
+          fail_susfs() {
+            echo "::error title=SUSFS integration failed::$1"
+            dump_susfs_tree
+            exit 3
+          }
+
+          echo "Cloning SUSFS from ${SUSFS_REPO}, branch ${SUSFS_BRANCH}"
+          git clone --depth=1 --branch "${SUSFS_BRANCH}" "${SUSFS_REPO}" susfs4ksu
+
+          echo "Available SUSFS patch files:"
+          find susfs4ksu -maxdepth 4 -type f \
+            \( -name '*.patch' -o -name '*.diff' \) \
+            -print | sort
+
+          SUSFS_KERNEL_PATCH=""
+          for candidate in \
+            susfs4ksu/kernel_patches/50_add_susfs_in_gki-android15-6.6.patch \
+            susfs4ksu/kernel_patches/50_add_susfs_in_gki-android15*.patch \
+            susfs4ksu/kernel_patches/50_add_susfs_in_gki*6.6*.patch \
+            susfs4ksu/kernel_patches/*android15*6.6*.patch \
+            susfs4ksu/kernel_patches/*gki*6.6*.patch \
+            susfs4ksu/kernel_patches/*6.6*.patch; do
+            for patch_file in ${candidate}; do
+              if [ -f "${patch_file}" ]; then
+                SUSFS_KERNEL_PATCH="${patch_file}"
+                break 2
+              fi
+            done
+          done
+
+          if [ -z "${SUSFS_KERNEL_PATCH}" ]; then
+            fail_susfs "No SUSFS kernel patch found for gki/android15-6.6."
+          fi
+
+          if [ ! -f susfs4ksu/kernel_patches/include/linux/susfs.h ]; then
+            fail_susfs "susfs4ksu/kernel_patches/include/linux/susfs.h is missing."
+          fi
+          if [ ! -d susfs4ksu/kernel_patches/fs ]; then
+            fail_susfs "susfs4ksu/kernel_patches/fs is missing."
+          fi
+          if [ ! -d susfs4ksu/kernel_patches/include/linux ]; then
+            fail_susfs "susfs4ksu/kernel_patches/include/linux is missing."
+          fi
+
+          echo "Selected SUSFS kernel patch: ${SUSFS_KERNEL_PATCH}"
+          echo "Copying SUSFS fs and include files into ${KERNEL_SRC}"
+          cp -v susfs4ksu/kernel_patches/fs/* "${KERNEL_SRC}/fs/"
+          cp -v susfs4ksu/kernel_patches/include/linux/* "${KERNEL_SRC}/include/linux/"
+
+          echo "Applying SUSFS kernel patch to ${KERNEL_SRC}"
+          cd "${KERNEL_SRC}"
+          if ! patch -p1 < "${GITHUB_WORKSPACE}/${SUSFS_KERNEL_PATCH}"; then
+            cd "${GITHUB_WORKSPACE}"
+            fail_susfs "Could not apply ${SUSFS_KERNEL_PATCH} to kernel-workspace/common automatically."
+          fi
+
+          cd "${GITHUB_WORKSPACE}"
+          if ! test -f kernel-workspace/common/include/linux/susfs.h; then
+            fail_susfs "kernel-workspace/common/include/linux/susfs.h is missing after SUSFS patch."
+          fi
+
+          echo "SUSFS header check OK:"
+          ls -l kernel-workspace/common/include/linux/susfs.h
+
       - name: Build GKI arm64 attempt
         run: |
           set -Eeuo pipefail
           : > "${GITHUB_WORKSPACE}/kernel_build.log"
           mkdir -p "${GITHUB_WORKSPACE}/${DIST_DIR}"
-
-          pick_build_config() {
-            local base_dir="$1"
-            for candidate in \
-              common/build.config.gki.aarch64 \
-              common/build.config.gki \
-              build.config.gki.aarch64 \
-              build.config.gki; do
-              if [ -f "${base_dir}/${candidate}" ]; then
-                printf '%s\n' "${candidate}"
-                return 0
-              fi
-            done
-            return 1
-          }
 
           echo "Build target: GKI arm64 android15-6.6 for ${DEVICE}"
           echo "ROM context: ${ROM_VERSION}"
@@ -184,28 +237,8 @@ jobs:
           echo "Kernel source: ${KERNEL_SRC}"
           echo "Kernel root: ${KERNEL_ROOT}"
 
-          if [ -x "${KERNEL_ROOT}/build/build.sh" ] || [ -f "${KERNEL_ROOT}/build/build.sh" ]; then
-            echo "Using legacy Android build script: ${KERNEL_ROOT}/build/build.sh"
-            BUILD_CONFIG_VALUE="$(pick_build_config "${KERNEL_ROOT}")"
-            echo "BUILD_CONFIG=${BUILD_CONFIG_VALUE}"
-            cd "${KERNEL_ROOT}"
-            chmod +x build/build.sh || true
-            BUILD_CONFIG="${BUILD_CONFIG_VALUE}" \
-              OUT_DIR="${GITHUB_WORKSPACE}/out" \
-              DIST_DIR="${GITHUB_WORKSPACE}/${DIST_DIR}" \
-              build/build.sh 2>&1 | tee -a "${GITHUB_WORKSPACE}/kernel_build.log"
-          elif [ -x "${KERNEL_SRC}/build/build.sh" ] || [ -f "${KERNEL_SRC}/build/build.sh" ]; then
-            echo "Using legacy Android build script: ${KERNEL_SRC}/build/build.sh"
-            BUILD_CONFIG_VALUE="$(pick_build_config "${KERNEL_SRC}")"
-            echo "BUILD_CONFIG=${BUILD_CONFIG_VALUE}"
-            cd "${KERNEL_SRC}"
-            chmod +x build/build.sh || true
-            BUILD_CONFIG="${BUILD_CONFIG_VALUE}" \
-              OUT_DIR="${GITHUB_WORKSPACE}/out" \
-              DIST_DIR="${GITHUB_WORKSPACE}/${DIST_DIR}" \
-              build/build.sh 2>&1 | tee -a "${GITHUB_WORKSPACE}/kernel_build.log"
-          elif [ -x "${KERNEL_ROOT}/tools/bazel" ] || [ -f "${KERNEL_ROOT}/MODULE.bazel" ] || find "${KERNEL_ROOT}" -maxdepth 3 \( -name 'BUILD.bazel' -o -name '.bazelrc' -o -name 'WORKSPACE' \) -print -quit | grep -q .; then
-            echo "::error title=Kleaf/Bazel workspace detected::android15-6.6 usually uses Kleaf/Bazel. This workflow will show the detected files and attempt //common:kernel_aarch64_dist if tools/bazel exists."
+          if [ ! -x "${KERNEL_ROOT}/tools/bazel" ]; then
+            echo "::error title=No tools/bazel::android15-6.6 GKI must be built with Kleaf/Bazel from the Android kernel manifest workspace."
             echo "Detected Bazel/Kleaf files:"
             find "${KERNEL_ROOT}" -maxdepth 5 -type f \
               \( -name 'BUILD' \
@@ -215,29 +248,18 @@ jobs:
               -o -name '*.bzl' \
               -o -name '.bazelrc' \) \
               -print | sort | awk 'NR <= 500 { print }'
-
-            if [ ! -x "${KERNEL_ROOT}/tools/bazel" ]; then
-              echo "::error title=No tools/bazel::Kleaf/Bazel files exist, but tools/bazel is missing. Use the Android kernel manifest workspace, not only a direct kernel/common clone."
-              exit 2
-            fi
-
-            echo "Attempting Kleaf target: //common:kernel_aarch64_dist"
-            cd "${KERNEL_ROOT}"
-            tools/bazel run \
-              --verbose_failures \
-              --sandbox_debug \
-              --jobs=4 \
-              //common:kernel_aarch64_dist \
-              -- --dist_dir="${GITHUB_WORKSPACE}/${DIST_DIR}" \
-              2>&1 | tee -a "${GITHUB_WORKSPACE}/kernel_build.log"
-          else
-            echo "::warning title=No Android build wrapper detected::Falling back to plain make gki_defconfig + Image/modules."
-            cd "${KERNEL_SRC}"
-            {
-              make O="${GITHUB_WORKSPACE}/out/make" ARCH=arm64 LLVM=1 gki_defconfig
-              make O="${GITHUB_WORKSPACE}/out/make" ARCH=arm64 LLVM=1 -j"$(nproc)" Image modules
-            } 2>&1 | tee -a "${GITHUB_WORKSPACE}/kernel_build.log"
+            exit 2
           fi
+
+          echo "Running Kleaf target: //common:kernel_aarch64_dist"
+          cd "${KERNEL_ROOT}"
+          tools/bazel run \
+            --verbose_failures \
+            --sandbox_debug \
+            --jobs=4 \
+            //common:kernel_aarch64_dist \
+            -- --dist_dir="${GITHUB_WORKSPACE}/${DIST_DIR}" \
+            2>&1 | tee -a "${GITHUB_WORKSPACE}/kernel_build.log"
 
       - name: Find kernel outputs
         if: always()
@@ -245,6 +267,11 @@ jobs:
           set -Eeuo pipefail
           mkdir -p "${ARTIFACT_DIR}"
           : > "${ARTIFACT_DIR}/found-outputs.txt"
+          if [ -f "${GITHUB_WORKSPACE}/kernel_build.log" ]; then
+            cp -v "${GITHUB_WORKSPACE}/kernel_build.log" "${ARTIFACT_DIR}/kernel_build.log"
+          else
+            : > "${ARTIFACT_DIR}/kernel_build.log"
+          fi
 
           echo "Searching for Image, *.ko, *.img under ${GITHUB_WORKSPACE}"
           find "${GITHUB_WORKSPACE}" -type f \
@@ -268,11 +295,9 @@ jobs:
         with:
           name: rodin-android15-6.6-sukisu-ultra-gki
           path: |
-            kernel_build.log
             artifacts/**
+            kernel_build.log
             out/dist/**
             kernel-workspace/out/**
             kernel-workspace/bazel-bin/common/**
-            kernel-common-direct/out/**
-            kernel-common-direct/bazel-bin/common/**
           if-no-files-found: warn
