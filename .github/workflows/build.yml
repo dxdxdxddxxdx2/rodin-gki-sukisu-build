@@ -9,9 +9,9 @@ on:
         default: common-android15-6.6
         type: string
       common_ref:
-        description: Optional kernel/common branch/tag/SHA. Leave empty to auto-detect Linux 6.6.89.
+        description: kernel/common branch/tag/SHA. Defaults to pinned Linux 6.6.89 tag.
         required: false
-        default: ''
+        default: refs/tags/android15-6.6-2025-06_r13
         type: string
 
 env:
@@ -19,7 +19,7 @@ env:
   ROM_VERSION: OS3.0.10.0.WOJMIXM
   ANDROID_COMMON_BRANCH: android15-6.6
   MANIFEST_REF: ${{ inputs.manifest_ref || 'common-android15-6.6' }}
-  COMMON_REF: ${{ inputs.common_ref || '' }}
+  COMMON_REF: ${{ inputs.common_ref || 'refs/tags/android15-6.6-2025-06_r13' }}
   EXPECTED_KERNEL_VERSION: 6.6.89
   KERNEL_WORKSPACE: kernel-workspace
   DIST_DIR: out/dist
@@ -124,202 +124,98 @@ jobs:
           : > "${kernel_version_file}"
 
           COMMON_REMOTE=https://android.googlesource.com/kernel/common
-          MANIFEST_REMOTE=https://android.googlesource.com/kernel/manifest
-          SELECTED_COMMON_REF=""
-          SELECTED_COMMON_COMMIT=""
-          SELECTED_COMMON_VERSION=""
-          SELECTED_SOURCE=""
-
-          makefile_kernelversion() {
-            awk '
-              /^VERSION[[:space:]]*=/ { version = $3 }
-              /^PATCHLEVEL[[:space:]]*=/ { patchlevel = $3 }
-              /^SUBLEVEL[[:space:]]*=/ { sublevel = $3 }
-              /^EXTRAVERSION[[:space:]]*=/ { extraversion = $3 }
-              END {
-                if (version && patchlevel && sublevel) {
-                  printf "%s.%s.%s%s\n", version, patchlevel, sublevel, extraversion
-                }
-              }
-            '
-          }
+          DEFAULT_COMMON_REF=refs/tags/android15-6.6-2025-06_r13
 
           resolve_common_ref() {
             local requested_ref="$1"
             local remote_ref=""
+            local candidates=()
 
-            for candidate in \
-              "${requested_ref}" \
-              "refs/tags/${requested_ref}" \
-              "refs/heads/${requested_ref}"; do
-              if git -C "${KERNEL_SRC}" ls-remote --exit-code --refs origin "${candidate}" >/dev/null 2>&1; then
+            if [ -z "${requested_ref}" ]; then
+              requested_ref="${DEFAULT_COMMON_REF}"
+            fi
+
+            if [[ "${requested_ref}" == refs/* ]]; then
+              candidates=("${requested_ref}")
+            else
+              candidates=(
+                "${requested_ref}"
+                "refs/tags/${requested_ref}"
+                "refs/heads/${requested_ref}"
+              )
+            fi
+
+            for candidate in "${candidates[@]}"; do
+              if git ls-remote --exit-code --refs "${COMMON_REMOTE}" "${candidate}" >/dev/null 2>&1; then
                 remote_ref="${candidate}"
                 break
               fi
             done
 
+            if [ -z "${remote_ref}" ] && [[ "${requested_ref}" =~ ^[0-9a-fA-F]{7,40}$ ]]; then
+              remote_ref="${requested_ref}"
+            fi
+
             echo "${remote_ref}"
-          }
-
-          probe_common_ref() {
-            local source="$1"
-            local requested_ref="$2"
-            local remote_ref=""
-            local commit_ref=""
-            local version=""
-            local sha=""
-
-            remote_ref="$(resolve_common_ref "${requested_ref}")"
-            if [ -z "${remote_ref}" ]; then
-              if [[ "${requested_ref}" =~ ^[0-9a-fA-F]{7,40}$ ]] && git -C "${KERNEL_SRC}" fetch --depth=1 origin "${requested_ref}" >/dev/null 2>&1; then
-                commit_ref="$(git -C "${KERNEL_SRC}" rev-parse 'FETCH_HEAD^{commit}')"
-                version="$(git -C "${KERNEL_SRC}" show "${commit_ref}:Makefile" | makefile_kernelversion)"
-                sha="$(git -C "${KERNEL_SRC}" rev-parse --short "${commit_ref}")"
-                printf '%s\t%s\t%s\t%s\t%s\n' "${source}" "${requested_ref}" "${requested_ref}" "${version}" "${sha}" | tee -a "${candidates_file}"
-                if [ -z "${SELECTED_COMMON_REF}" ] && [ "${version}" = "${EXPECTED_KERNEL_VERSION}" ]; then
-                  SELECTED_COMMON_REF="${requested_ref}"
-                  SELECTED_COMMON_COMMIT="${commit_ref}"
-                  SELECTED_COMMON_VERSION="${version}"
-                  SELECTED_SOURCE="${source}"
-                fi
-                return 0
-              fi
-              printf '%s\t%s\tmissing\t-\t-\n' "${source}" "${requested_ref}" | tee -a "${candidates_file}"
-              return 0
-            fi
-
-            if ! git -C "${KERNEL_SRC}" fetch --depth=1 --no-tags origin "${remote_ref}" >/dev/null 2>&1; then
-              printf '%s\t%s\tfetch_failed\t%s\t-\n' "${source}" "${requested_ref}" "${remote_ref}" | tee -a "${candidates_file}"
-              return 0
-            fi
-
-            commit_ref="$(git -C "${KERNEL_SRC}" rev-parse 'FETCH_HEAD^{commit}')"
-            version="$(git -C "${KERNEL_SRC}" show "${commit_ref}:Makefile" | makefile_kernelversion)"
-            sha="$(git -C "${KERNEL_SRC}" rev-parse --short "${commit_ref}")"
-            printf '%s\t%s\t%s\t%s\t%s\n' "${source}" "${requested_ref}" "${remote_ref}" "${version}" "${sha}" | tee -a "${candidates_file}"
-
-            if [ -z "${SELECTED_COMMON_REF}" ] && [ "${version}" = "${EXPECTED_KERNEL_VERSION}" ]; then
-              SELECTED_COMMON_REF="${remote_ref}"
-              SELECTED_COMMON_COMMIT="${commit_ref}"
-              SELECTED_COMMON_VERSION="${version}"
-              SELECTED_SOURCE="${source}"
-            fi
-          }
-
-          probe_manifest_ref() {
-            local manifest_ref="$1"
-            local tmpdir=""
-            local common_revision=""
-
-            tmpdir="$(mktemp -d)"
-            git -C "${tmpdir}" init -q
-            if ! git -C "${tmpdir}" fetch --depth=1 "${MANIFEST_REMOTE}" "${manifest_ref}" >/dev/null 2>&1; then
-              printf 'manifest:%s\t-\tfetch_failed\t-\t-\n' "${manifest_ref}" | tee -a "${candidates_file}"
-              rm -rf "${tmpdir}"
-              return 0
-            fi
-
-            if ! git -C "${tmpdir}" show FETCH_HEAD:default.xml > "${tmpdir}/default.xml" 2>/dev/null; then
-              printf 'manifest:%s\t-\tmissing_default_xml\t-\t-\n' "${manifest_ref}" | tee -a "${candidates_file}"
-              rm -rf "${tmpdir}"
-              return 0
-            fi
-
-            common_revision="$(python3 - "${tmpdir}/default.xml" <<'PY'
-          import sys
-          import xml.etree.ElementTree as ET
-
-          manifest = ET.parse(sys.argv[1]).getroot()
-          for project in manifest.findall("project"):
-              if project.attrib.get("path") == "common" or project.attrib.get("name") == "kernel/common":
-                  print(project.attrib.get("revision", ""))
-                  break
-          PY
-            )"
-
-            if [ -z "${common_revision}" ]; then
-              printf 'manifest:%s\t-\tmissing_common_revision\t-\t-\n' "${manifest_ref}" | tee -a "${candidates_file}"
-              rm -rf "${tmpdir}"
-              return 0
-            fi
-
-            probe_common_ref "manifest:${manifest_ref}" "${common_revision}"
-            rm -rf "${tmpdir}"
           }
 
           {
             echo "source	requested_common_ref	resolved_common_ref	kernel_version	commit"
             echo "manifest_ref_input	${MANIFEST_REF}	-	-	-"
-            echo "common_ref_input	${COMMON_REF:-<auto>}	-	-	-"
+            echo "common_ref_input	${COMMON_REF:-${DEFAULT_COMMON_REF}}	-	-	-"
           } | tee -a "${candidates_file}"
 
-          if [ -n "${COMMON_REF}" ]; then
-            probe_common_ref "input:common_ref" "${COMMON_REF}"
-          else
-            manifest_candidates="$(mktemp)"
-            {
-              echo refs/heads/common-android15-6.6-2025-04
-              echo refs/heads/common-android15-6.6-2025-05
-              echo refs/heads/common-android15-6.6-2025-06
-              git ls-remote --heads --tags "${MANIFEST_REMOTE}" \
-                | awk '{ print $2 }' \
-                | grep -E 'refs/(heads|tags)/(common-)?android15-6\.6-2025-(04|05|06)' || true
-            } | sort -u > "${manifest_candidates}"
+          requested_common_ref="${COMMON_REF:-${DEFAULT_COMMON_REF}}"
+          resolved_common_ref="$(resolve_common_ref "${requested_common_ref}")"
 
-            while IFS= read -r manifest_candidate; do
-              [ -n "${manifest_candidate}" ] || continue
-              probe_manifest_ref "${manifest_candidate}"
-            done < "${manifest_candidates}"
-            rm -f "${manifest_candidates}"
-
-            common_candidates="$(mktemp)"
-            {
-              echo refs/tags/android15-6.6.89_r00
-              echo refs/heads/android15-6.6-2025-06
-              echo refs/heads/android15-6.6-2025-05
-              echo refs/heads/android15-6.6-2025-04
-              git -C "${KERNEL_SRC}" ls-remote --heads --tags origin \
-                | awk '{ print $2 }' \
-                | grep -E 'refs/(heads|tags)/android15-6\.6(\.89|-(2025-04|2025-05|2025-06))' || true
-            } | sort -u > "${common_candidates}"
-
-            while IFS= read -r common_candidate; do
-              [ -n "${common_candidate}" ] || continue
-              probe_common_ref "common:${common_candidate}" "${common_candidate}"
-            done < "${common_candidates}"
-            rm -f "${common_candidates}"
-          fi
-
-          if [ -z "${SELECTED_COMMON_REF}" ]; then
-            current_version="$(git -C "${KERNEL_SRC}" -c safe.directory="${KERNEL_SRC}" show HEAD:Makefile | makefile_kernelversion || true)"
+          if [ -z "${resolved_common_ref}" ]; then
             {
               echo "Manifest ref: ${MANIFEST_REF}"
-              echo "Common ref input: ${COMMON_REF:-<auto>}"
-              echo "Current repo-synced common HEAD: $(git -C "${KERNEL_SRC}" rev-parse HEAD)"
-              echo "Current repo-synced common version: ${current_version:-unknown}"
+              echo "Common remote: ${COMMON_REMOTE}"
+              echo "Requested common ref: ${requested_common_ref}"
               echo "Expected kernel version: ${EXPECTED_KERNEL_VERSION}"
             } | tee -a "${kernel_version_file}"
-            echo "::error title=No ${EXPECTED_KERNEL_VERSION} kernel ref found::Could not auto-detect or resolve a kernel/common ref with Linux ${EXPECTED_KERNEL_VERSION}. See remote_refs.txt and kernel_ref_candidates.txt artifacts." | tee -a "${kernel_version_file}"
+            printf 'input:common_ref\t%s\tmissing\t-\t-\n' "${requested_common_ref}" | tee -a "${candidates_file}"
+            echo "::error title=Missing kernel/common ref::Could not resolve ${requested_common_ref} in ${COMMON_REMOTE}. See remote_refs.txt and kernel_ref_candidates.txt artifacts." | tee -a "${kernel_version_file}"
             exit 10
           fi
 
-          echo "Selected common source: ${SELECTED_SOURCE}" | tee -a "${kernel_version_file}"
-          echo "Selected common ref: ${SELECTED_COMMON_REF}" | tee -a "${kernel_version_file}"
-          echo "Selected common commit: ${SELECTED_COMMON_COMMIT}" | tee -a "${kernel_version_file}"
+          echo "Fetching kernel/common from ${COMMON_REMOTE}"
+          echo "Resolved common ref: ${resolved_common_ref}"
+          if ! git -C "${KERNEL_SRC}" fetch --depth=1 --no-tags "${COMMON_REMOTE}" "${resolved_common_ref}"; then
+            {
+              echo "Manifest ref: ${MANIFEST_REF}"
+              echo "Common remote: ${COMMON_REMOTE}"
+              echo "Requested common ref: ${requested_common_ref}"
+              echo "Resolved common ref: ${resolved_common_ref}"
+              echo "Expected kernel version: ${EXPECTED_KERNEL_VERSION}"
+            } | tee -a "${kernel_version_file}"
+            printf 'input:common_ref\t%s\t%s\tfetch_failed\t-\n' "${requested_common_ref}" "${resolved_common_ref}" | tee -a "${candidates_file}"
+            echo "::error title=Fetch failed::Could not fetch ${resolved_common_ref} from ${COMMON_REMOTE}." | tee -a "${kernel_version_file}"
+            exit 10
+          fi
 
-          git -C "${KERNEL_SRC}" checkout --detach "${SELECTED_COMMON_COMMIT}"
+          git -C "${KERNEL_SRC}" checkout --detach FETCH_HEAD
           cd "${KERNEL_SRC}"
           kernel_version="$(make -s kernelversion)"
+          kernel_commit="$(git rev-parse HEAD)"
+          kernel_commit_short="$(git rev-parse --short HEAD)"
+
+          printf 'input:common_ref\t%s\t%s\t%s\t%s\n' "${requested_common_ref}" "${resolved_common_ref}" "${kernel_version}" "${kernel_commit_short}" | tee -a "${GITHUB_WORKSPACE}/${candidates_file}"
           {
+            echo "Manifest ref: ${MANIFEST_REF}"
+            echo "Common remote: ${COMMON_REMOTE}"
+            echo "Requested common ref: ${requested_common_ref}"
+            echo "Resolved common ref: ${resolved_common_ref}"
             echo "Kernel commit: $(git rev-parse HEAD)"
-            echo "Kernel commit short: $(git rev-parse --short HEAD)"
+            echo "Kernel commit short: ${kernel_commit_short}"
             echo "Kernel commit subject: $(git log -1 --pretty=%s)"
             echo "Kernel version: ${kernel_version}"
             echo "Expected kernel version: ${EXPECTED_KERNEL_VERSION}"
           } | tee -a "${GITHUB_WORKSPACE}/${kernel_version_file}"
 
           if [ "${kernel_version}" != "${EXPECTED_KERNEL_VERSION}" ]; then
-            echo "::error title=Wrong kernel version::Selected ${SELECTED_COMMON_REF} gives ${kernel_version}, expected ${EXPECTED_KERNEL_VERSION}." | tee -a "${GITHUB_WORKSPACE}/${kernel_version_file}"
+            echo "::error title=Wrong kernel version::Selected ${resolved_common_ref} gives ${kernel_version}, expected ${EXPECTED_KERNEL_VERSION}." | tee -a "${GITHUB_WORKSPACE}/${kernel_version_file}"
             exit 11
           fi
 
