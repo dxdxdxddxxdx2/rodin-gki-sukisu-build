@@ -265,29 +265,65 @@ jobs:
         if: always()
         run: |
           set -Eeuo pipefail
-          mkdir -p "${ARTIFACT_DIR}"
+          mkdir -p "${ARTIFACT_DIR}/outputs"
           : > "${ARTIFACT_DIR}/found-outputs.txt"
-          if [ -f "${GITHUB_WORKSPACE}/kernel_build.log" ]; then
-            cp -v "${GITHUB_WORKSPACE}/kernel_build.log" "${ARTIFACT_DIR}/kernel_build.log"
-          else
-            : > "${ARTIFACT_DIR}/kernel_build.log"
-          fi
 
-          echo "Searching for Image, *.ko, *.img under ${GITHUB_WORKSPACE}"
-          find "${GITHUB_WORKSPACE}" -type f \
-            \( -name 'Image' -o -name '*.ko' -o -name '*.img' \) \
-            -print | sort | tee "${ARTIFACT_DIR}/found-outputs.txt"
+          if [ ! -f "${GITHUB_WORKSPACE}/kernel_build.log" ]; then
+            : > "${GITHUB_WORKSPACE}/kernel_build.log"
+          fi
+          cp -v "${GITHUB_WORKSPACE}/kernel_build.log" "${ARTIFACT_DIR}/kernel_build.log"
+
+          candidate_list="$(mktemp)"
+
+          echo "Collecting files from dist directories only:"
+          for dist_dir in \
+            "${GITHUB_WORKSPACE}/kernel-workspace/out/dist" \
+            "${GITHUB_WORKSPACE}/out/dist"; do
+            if [ -d "${dist_dir}" ]; then
+              echo "Found dist dir: ${dist_dir}"
+              find "${dist_dir}" -type f -print >> "${candidate_list}"
+            else
+              echo "Missing dist dir: ${dist_dir}"
+            fi
+          done
+
+          echo "Searching for kernel outputs while excluding Bazel internals:"
+          find "${GITHUB_WORKSPACE}" \
+            \( -path "${GITHUB_WORKSPACE}/${ARTIFACT_DIR}" \
+            -o -path "${GITHUB_WORKSPACE}/${ARTIFACT_DIR}/*" \
+            -o -path '*/out/bazel/output_user_root' \
+            -o -path '*/out/bazel/output_user_root/*' \
+            -o -path '*/sandbox' \
+            -o -path '*/sandbox/*' \
+            -o -path '*/external' \
+            -o -path '*/external/*' \
+            -o -path '*/prebuilt_ndk' \
+            -o -path '*/prebuilt_ndk/*' \) -prune \
+            -o -type f \
+            \( -name 'Image' \
+            -o -name 'Image.gz' \
+            -o -name '*.ko' \
+            -o -name '*.img' \
+            -o -name 'vmlinux' \
+            -o -name 'System.map' \) \
+            -print >> "${candidate_list}"
+
+          sort -u "${candidate_list}" | tee "${ARTIFACT_DIR}/found-outputs.txt"
 
           while IFS= read -r output_file; do
             [ -n "${output_file}" ] || continue
             relative_path="${output_file#${GITHUB_WORKSPACE}/}"
-            destination="${ARTIFACT_DIR}/${relative_path}"
+            destination="${ARTIFACT_DIR}/outputs/${relative_path}"
             mkdir -p "$(dirname "${destination}")"
             cp -v "${output_file}" "${destination}"
           done < "${ARTIFACT_DIR}/found-outputs.txt"
 
+          rm -f "${candidate_list}"
+
           echo "Artifact directory:"
           find "${ARTIFACT_DIR}" -type f -print | sort
+          echo "Artifact file count:"
+          find "${ARTIFACT_DIR}" -type f | wc -l
 
       - name: Upload kernel outputs
         if: always()
@@ -297,7 +333,4 @@ jobs:
           path: |
             artifacts/**
             kernel_build.log
-            out/dist/**
-            kernel-workspace/out/**
-            kernel-workspace/bazel-bin/common/**
           if-no-files-found: warn
