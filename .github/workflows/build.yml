@@ -2,12 +2,20 @@ name: Build rodin android15-6.6 GKI with SukiSU Ultra
 
 on:
   workflow_dispatch:
+    inputs:
+      kernel_ref:
+        description: Android common kernel tag/ref to build; android15-6.6-2025-06_r13 is Linux 6.6.89.
+        required: true
+        default: android15-6.6-2025-06_r13
+        type: string
 
 env:
   DEVICE: rodin
   ROM_VERSION: OS3.0.10.0.WOJMIXM
   ANDROID_COMMON_BRANCH: android15-6.6
   ANDROID_MANIFEST_BRANCH: common-android15-6.6
+  KERNEL_REF: ${{ inputs.kernel_ref || 'android15-6.6-2025-06_r13' }}
+  EXPECTED_KERNEL_VERSION: 6.6.89
   KERNEL_WORKSPACE: kernel-workspace
   DIST_DIR: out/dist
   ARTIFACT_DIR: artifacts
@@ -86,6 +94,112 @@ jobs:
           echo "KERNEL_SRC=${GITHUB_WORKSPACE}/${KERNEL_WORKSPACE}/common" >> "${GITHUB_ENV}"
           echo "KERNEL_ROOT=${GITHUB_WORKSPACE}/${KERNEL_WORKSPACE}" >> "${GITHUB_ENV}"
           echo "FETCH_MODE=repo manifest ${ANDROID_MANIFEST_BRANCH}" >> "${GITHUB_ENV}"
+
+      - name: Diagnose Android common kernel refs
+        run: |
+          set -Eeuo pipefail
+          mkdir -p "${ARTIFACT_DIR}"
+          diagnostics_file="${ARTIFACT_DIR}/kernel_ref_diagnostics.txt"
+          : > "${diagnostics_file}"
+
+          cd "${KERNEL_SRC}"
+
+          makefile_kernelversion() {
+            awk '
+              /^VERSION[[:space:]]*=/ { version = $3 }
+              /^PATCHLEVEL[[:space:]]*=/ { patchlevel = $3 }
+              /^SUBLEVEL[[:space:]]*=/ { sublevel = $3 }
+              /^EXTRAVERSION[[:space:]]*=/ { extraversion = $3 }
+              END {
+                if (version && patchlevel && sublevel) {
+                  printf "%s.%s.%s%s\n", version, patchlevel, sublevel, extraversion
+                }
+              }
+            '
+          }
+
+          probe_ref() {
+            local remote_ref="$1"
+            local display_ref="${remote_ref#refs/tags/}"
+
+            if ! git ls-remote --exit-code --refs origin "${remote_ref}" >/dev/null 2>&1; then
+              echo "${display_ref}: missing" | tee -a "${GITHUB_WORKSPACE}/${diagnostics_file}"
+              return 0
+            fi
+
+            git fetch --depth=1 --no-tags origin "${remote_ref}" >/dev/null 2>&1
+            commit_ref="$(git rev-parse 'FETCH_HEAD^{commit}')"
+            version="$(git show "${commit_ref}:Makefile" | makefile_kernelversion)"
+            sha="$(git rev-parse --short "${commit_ref}")"
+            echo "${display_ref}: ${version} (${sha})" | tee -a "${GITHUB_WORKSPACE}/${diagnostics_file}"
+          }
+
+          echo "Diagnostic Android common kernel refs:" | tee -a "${GITHUB_WORKSPACE}/${diagnostics_file}"
+          for ref in \
+            refs/tags/android15-6.6-2025-03_r15 \
+            refs/tags/android15-6.6-2025-04_r3; do
+            probe_ref "${ref}"
+          done
+
+          while IFS= read -r ref; do
+            [ -n "${ref}" ] || continue
+            probe_ref "${ref}"
+          done < <(git ls-remote --refs --tags origin 'refs/tags/android15-6.6-2025-05*' | awk '{ print $2 }' | sort -V)
+
+          probe_ref refs/tags/android15-6.6-2025-06_r13
+
+      - name: Pin and verify kernel/common ref
+        run: |
+          set -Eeuo pipefail
+          mkdir -p "${ARTIFACT_DIR}"
+          kernel_version_file="${ARTIFACT_DIR}/kernel_version.txt"
+          : > "${kernel_version_file}"
+
+          cd "${KERNEL_SRC}"
+
+          resolve_and_fetch_ref() {
+            local requested_ref="$1"
+            local remote_ref=""
+
+            for candidate in \
+              "${requested_ref}" \
+              "refs/tags/${requested_ref}" \
+              "refs/heads/${requested_ref}"; do
+              if git ls-remote --exit-code --refs origin "${candidate}" >/dev/null 2>&1; then
+                remote_ref="${candidate}"
+                break
+              fi
+            done
+
+            if [ -z "${remote_ref}" ]; then
+              echo "::error title=Kernel ref not found::Could not find '${requested_ref}' as a ref, tag, or branch in kernel/common." | tee -a "${GITHUB_WORKSPACE}/${kernel_version_file}"
+              exit 10
+            fi
+
+            echo "${remote_ref}"
+          }
+
+          remote_ref="$(resolve_and_fetch_ref "${KERNEL_REF}")"
+          echo "Requested kernel_ref: ${KERNEL_REF}" | tee -a "${GITHUB_WORKSPACE}/${kernel_version_file}"
+          echo "Resolved kernel ref: ${remote_ref}" | tee -a "${GITHUB_WORKSPACE}/${kernel_version_file}"
+
+          git fetch --depth=1 --no-tags origin "${remote_ref}"
+          commit_ref="$(git rev-parse 'FETCH_HEAD^{commit}')"
+          git checkout --detach "${commit_ref}"
+
+          kernel_version="$(make -s kernelversion)"
+          {
+            echo "Kernel commit: $(git rev-parse HEAD)"
+            echo "Kernel commit short: $(git rev-parse --short HEAD)"
+            echo "Kernel commit subject: $(git log -1 --pretty=%s)"
+            echo "Kernel version: ${kernel_version}"
+            echo "Expected kernel version: ${EXPECTED_KERNEL_VERSION}"
+          } | tee -a "${GITHUB_WORKSPACE}/${kernel_version_file}"
+
+          if [ "${kernel_version}" != "${EXPECTED_KERNEL_VERSION}" ]; then
+            echo "::error title=Wrong kernel version::${remote_ref} gives ${kernel_version}, expected ${EXPECTED_KERNEL_VERSION}. Set workflow input kernel_ref to a tag that gives ${EXPECTED_KERNEL_VERSION}." | tee -a "${GITHUB_WORKSPACE}/${kernel_version_file}"
+            exit 11
+          fi
 
       - name: Inspect kernel tree before patch
         run: |
