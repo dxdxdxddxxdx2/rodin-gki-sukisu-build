@@ -160,6 +160,7 @@ jobs:
       - name: Build GKI arm64 attempt
         run: |
           set -Eeuo pipefail
+          : > "${GITHUB_WORKSPACE}/kernel_build.log"
           mkdir -p "${GITHUB_WORKSPACE}/${DIST_DIR}"
 
           pick_build_config() {
@@ -192,7 +193,7 @@ jobs:
             BUILD_CONFIG="${BUILD_CONFIG_VALUE}" \
               OUT_DIR="${GITHUB_WORKSPACE}/out" \
               DIST_DIR="${GITHUB_WORKSPACE}/${DIST_DIR}" \
-              build/build.sh
+              build/build.sh 2>&1 | tee -a "${GITHUB_WORKSPACE}/kernel_build.log"
           elif [ -x "${KERNEL_SRC}/build/build.sh" ] || [ -f "${KERNEL_SRC}/build/build.sh" ]; then
             echo "Using legacy Android build script: ${KERNEL_SRC}/build/build.sh"
             BUILD_CONFIG_VALUE="$(pick_build_config "${KERNEL_SRC}")"
@@ -202,7 +203,7 @@ jobs:
             BUILD_CONFIG="${BUILD_CONFIG_VALUE}" \
               OUT_DIR="${GITHUB_WORKSPACE}/out" \
               DIST_DIR="${GITHUB_WORKSPACE}/${DIST_DIR}" \
-              build/build.sh
+              build/build.sh 2>&1 | tee -a "${GITHUB_WORKSPACE}/kernel_build.log"
           elif [ -x "${KERNEL_ROOT}/tools/bazel" ] || [ -f "${KERNEL_ROOT}/MODULE.bazel" ] || find "${KERNEL_ROOT}" -maxdepth 3 \( -name 'BUILD.bazel' -o -name '.bazelrc' -o -name 'WORKSPACE' \) -print -quit | grep -q .; then
             echo "::error title=Kleaf/Bazel workspace detected::android15-6.6 usually uses Kleaf/Bazel. This workflow will show the detected files and attempt //common:kernel_aarch64_dist if tools/bazel exists."
             echo "Detected Bazel/Kleaf files:"
@@ -222,12 +223,20 @@ jobs:
 
             echo "Attempting Kleaf target: //common:kernel_aarch64_dist"
             cd "${KERNEL_ROOT}"
-            tools/bazel run //common:kernel_aarch64_dist -- --dist_dir="${GITHUB_WORKSPACE}/${DIST_DIR}"
+            tools/bazel run \
+              --verbose_failures \
+              --sandbox_debug \
+              --jobs=4 \
+              //common:kernel_aarch64_dist \
+              -- --dist_dir="${GITHUB_WORKSPACE}/${DIST_DIR}" \
+              2>&1 | tee -a "${GITHUB_WORKSPACE}/kernel_build.log"
           else
             echo "::warning title=No Android build wrapper detected::Falling back to plain make gki_defconfig + Image/modules."
             cd "${KERNEL_SRC}"
-            make O="${GITHUB_WORKSPACE}/out/make" ARCH=arm64 LLVM=1 gki_defconfig
-            make O="${GITHUB_WORKSPACE}/out/make" ARCH=arm64 LLVM=1 -j"$(nproc)" Image modules
+            {
+              make O="${GITHUB_WORKSPACE}/out/make" ARCH=arm64 LLVM=1 gki_defconfig
+              make O="${GITHUB_WORKSPACE}/out/make" ARCH=arm64 LLVM=1 -j"$(nproc)" Image modules
+            } 2>&1 | tee -a "${GITHUB_WORKSPACE}/kernel_build.log"
           fi
 
       - name: Find kernel outputs
@@ -258,5 +267,12 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: rodin-android15-6.6-sukisu-ultra-gki
-          path: artifacts/
+          path: |
+            kernel_build.log
+            artifacts/**
+            out/dist/**
+            kernel-workspace/out/**
+            kernel-workspace/bazel-bin/common/**
+            kernel-common-direct/out/**
+            kernel-common-direct/bazel-bin/common/**
           if-no-files-found: warn
