@@ -1,0 +1,262 @@
+name: Build rodin android15-6.6 GKI with SukiSU Ultra
+
+on:
+  workflow_dispatch:
+
+env:
+  DEVICE: rodin
+  ROM_VERSION: OS3.0.10.0.WOJMIXM
+  ANDROID_COMMON_BRANCH: android15-6.6
+  ANDROID_MANIFEST_BRANCH: common-android15-6.6
+  KERNEL_WORKSPACE: kernel-workspace
+  KERNEL_DIRECT_CLONE: kernel-common-direct
+  DIST_DIR: out/dist
+  ARTIFACT_DIR: artifacts
+  SUKISU_SETUP_URL: https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/main/kernel/setup.sh
+
+jobs:
+  build-gki:
+    name: Build GKI arm64 attempt
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    steps:
+      - name: Checkout this repository
+        uses: actions/checkout@v4
+
+      - name: Show host context
+        run: |
+          set -Eeuo pipefail
+          uname -a
+          lsb_release -a || true
+          df -h
+          nproc
+          git --version
+
+      - name: Install dependencies
+        run: |
+          set -Eeuo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            bc \
+            bison \
+            build-essential \
+            ca-certificates \
+            cpio \
+            curl \
+            dwarves \
+            file \
+            flex \
+            git \
+            libelf-dev \
+            libncurses-dev \
+            libssl-dev \
+            lld \
+            llvm \
+            make \
+            pahole \
+            python-is-python3 \
+            python3 \
+            rsync \
+            unzip \
+            xz-utils \
+            zip \
+            zstd
+
+      - name: Fetch Android common kernel
+        run: |
+          set -Eeuo pipefail
+          mkdir -p "${KERNEL_WORKSPACE}" "${KERNEL_DIRECT_CLONE}"
+
+          echo "Trying Android kernel manifest branch: ${ANDROID_MANIFEST_BRANCH}"
+          curl -L --fail --show-error \
+            https://storage.googleapis.com/git-repo-downloads/repo \
+            -o "${KERNEL_WORKSPACE}/repo"
+          chmod +x "${KERNEL_WORKSPACE}/repo"
+
+          if (
+            cd "${KERNEL_WORKSPACE}"
+            ./repo init \
+              -u https://android.googlesource.com/kernel/manifest \
+              -b "${ANDROID_MANIFEST_BRANCH}" \
+              --depth=1
+            ./repo sync -c --no-tags --fail-fast -j"$(nproc)"
+          ); then
+            echo "KERNEL_SRC=${GITHUB_WORKSPACE}/${KERNEL_WORKSPACE}/common" >> "${GITHUB_ENV}"
+            echo "KERNEL_ROOT=${GITHUB_WORKSPACE}/${KERNEL_WORKSPACE}" >> "${GITHUB_ENV}"
+            echo "FETCH_MODE=repo manifest ${ANDROID_MANIFEST_BRANCH}" >> "${GITHUB_ENV}"
+          else
+            echo "::warning title=Manifest sync failed::Falling back to direct kernel/common clone."
+            git clone \
+              --depth=1 \
+              --branch "${ANDROID_COMMON_BRANCH}" \
+              https://android.googlesource.com/kernel/common \
+              "${KERNEL_DIRECT_CLONE}/common"
+            echo "KERNEL_SRC=${GITHUB_WORKSPACE}/${KERNEL_DIRECT_CLONE}/common" >> "${GITHUB_ENV}"
+            echo "KERNEL_ROOT=${GITHUB_WORKSPACE}/${KERNEL_DIRECT_CLONE}" >> "${GITHUB_ENV}"
+            echo "FETCH_MODE=direct git clone ${ANDROID_COMMON_BRANCH}" >> "${GITHUB_ENV}"
+          fi
+
+      - name: Inspect kernel tree before patch
+        run: |
+          set -Eeuo pipefail
+          echo "Fetch mode: ${FETCH_MODE}"
+          echo "Kernel root: ${KERNEL_ROOT}"
+          echo "Kernel source: ${KERNEL_SRC}"
+
+          cd "${KERNEL_SRC}"
+          pwd
+          git status --short || true
+          git log -1 --oneline || true
+
+          echo "Top-level files:"
+          find . -maxdepth 1 -mindepth 1 -printf '%P\n' | sort
+
+          echo "Build-related files under kernel source:"
+          find . -maxdepth 4 -type f \
+            \( -name 'Makefile' \
+            -o -name 'build.sh' \
+            -o -name 'build.config*' \
+            -o -name 'BUILD' \
+            -o -name 'BUILD.bazel' \
+            -o -name 'WORKSPACE' \
+            -o -name 'MODULE.bazel' \
+            -o -name '*.bzl' \
+            -o -name '.bazelrc' \) \
+            -print | sort | awk 'NR <= 300 { print }'
+
+          echo "Build-related files under workspace root:"
+          find "${KERNEL_ROOT}" -maxdepth 4 -type f \
+            \( -name 'build.sh' \
+            -o -name 'BUILD' \
+            -o -name 'BUILD.bazel' \
+            -o -name 'WORKSPACE' \
+            -o -name 'MODULE.bazel' \
+            -o -name '*.bzl' \
+            -o -name '.bazelrc' \) \
+            -print | sort | awk 'NR <= 300 { print }'
+
+      - name: Apply SukiSU Ultra builtin patch
+        run: |
+          set -Eeuo pipefail
+          cd "${KERNEL_SRC}"
+
+          echo "Downloading official SukiSU Ultra setup.sh:"
+          echo "${SUKISU_SETUP_URL}"
+          curl -L --fail --show-error "${SUKISU_SETUP_URL}" -o /tmp/sukisu-setup.sh
+          chmod +x /tmp/sukisu-setup.sh
+
+          echo "Running SukiSU Ultra setup.sh in builtin mode."
+          bash /tmp/sukisu-setup.sh builtin
+
+          echo "SukiSU-related files after patch:"
+          find . -maxdepth 5 \
+            \( -iname '*sukisu*' -o -iname '*kernelsu*' -o -iname '*ksu*' \) \
+            -print | sort | awk 'NR <= 300 { print }'
+
+          echo "Git status after SukiSU patch:"
+          git status --short || true
+
+      - name: Build GKI arm64 attempt
+        run: |
+          set -Eeuo pipefail
+          mkdir -p "${GITHUB_WORKSPACE}/${DIST_DIR}"
+
+          pick_build_config() {
+            local base_dir="$1"
+            for candidate in \
+              common/build.config.gki.aarch64 \
+              common/build.config.gki \
+              build.config.gki.aarch64 \
+              build.config.gki; do
+              if [ -f "${base_dir}/${candidate}" ]; then
+                printf '%s\n' "${candidate}"
+                return 0
+              fi
+            done
+            return 1
+          }
+
+          echo "Build target: GKI arm64 android15-6.6 for ${DEVICE}"
+          echo "ROM context: ${ROM_VERSION}"
+          echo "Page size context: 4K"
+          echo "Kernel source: ${KERNEL_SRC}"
+          echo "Kernel root: ${KERNEL_ROOT}"
+
+          if [ -x "${KERNEL_ROOT}/build/build.sh" ] || [ -f "${KERNEL_ROOT}/build/build.sh" ]; then
+            echo "Using legacy Android build script: ${KERNEL_ROOT}/build/build.sh"
+            BUILD_CONFIG_VALUE="$(pick_build_config "${KERNEL_ROOT}")"
+            echo "BUILD_CONFIG=${BUILD_CONFIG_VALUE}"
+            cd "${KERNEL_ROOT}"
+            chmod +x build/build.sh || true
+            BUILD_CONFIG="${BUILD_CONFIG_VALUE}" \
+              OUT_DIR="${GITHUB_WORKSPACE}/out" \
+              DIST_DIR="${GITHUB_WORKSPACE}/${DIST_DIR}" \
+              build/build.sh
+          elif [ -x "${KERNEL_SRC}/build/build.sh" ] || [ -f "${KERNEL_SRC}/build/build.sh" ]; then
+            echo "Using legacy Android build script: ${KERNEL_SRC}/build/build.sh"
+            BUILD_CONFIG_VALUE="$(pick_build_config "${KERNEL_SRC}")"
+            echo "BUILD_CONFIG=${BUILD_CONFIG_VALUE}"
+            cd "${KERNEL_SRC}"
+            chmod +x build/build.sh || true
+            BUILD_CONFIG="${BUILD_CONFIG_VALUE}" \
+              OUT_DIR="${GITHUB_WORKSPACE}/out" \
+              DIST_DIR="${GITHUB_WORKSPACE}/${DIST_DIR}" \
+              build/build.sh
+          elif [ -x "${KERNEL_ROOT}/tools/bazel" ] || [ -f "${KERNEL_ROOT}/MODULE.bazel" ] || find "${KERNEL_ROOT}" -maxdepth 3 \( -name 'BUILD.bazel' -o -name '.bazelrc' -o -name 'WORKSPACE' \) -print -quit | grep -q .; then
+            echo "::error title=Kleaf/Bazel workspace detected::android15-6.6 usually uses Kleaf/Bazel. This workflow will show the detected files and attempt //common:kernel_aarch64_dist if tools/bazel exists."
+            echo "Detected Bazel/Kleaf files:"
+            find "${KERNEL_ROOT}" -maxdepth 5 -type f \
+              \( -name 'BUILD' \
+              -o -name 'BUILD.bazel' \
+              -o -name 'WORKSPACE' \
+              -o -name 'MODULE.bazel' \
+              -o -name '*.bzl' \
+              -o -name '.bazelrc' \) \
+              -print | sort | awk 'NR <= 500 { print }'
+
+            if [ ! -x "${KERNEL_ROOT}/tools/bazel" ]; then
+              echo "::error title=No tools/bazel::Kleaf/Bazel files exist, but tools/bazel is missing. Use the Android kernel manifest workspace, not only a direct kernel/common clone."
+              exit 2
+            fi
+
+            echo "Attempting Kleaf target: //common:kernel_aarch64_dist"
+            cd "${KERNEL_ROOT}"
+            tools/bazel run //common:kernel_aarch64_dist -- --dist_dir="${GITHUB_WORKSPACE}/${DIST_DIR}"
+          else
+            echo "::warning title=No Android build wrapper detected::Falling back to plain make gki_defconfig + Image/modules."
+            cd "${KERNEL_SRC}"
+            make O="${GITHUB_WORKSPACE}/out/make" ARCH=arm64 LLVM=1 gki_defconfig
+            make O="${GITHUB_WORKSPACE}/out/make" ARCH=arm64 LLVM=1 -j"$(nproc)" Image modules
+          fi
+
+      - name: Find kernel outputs
+        if: always()
+        run: |
+          set -Eeuo pipefail
+          mkdir -p "${ARTIFACT_DIR}"
+          : > "${ARTIFACT_DIR}/found-outputs.txt"
+
+          echo "Searching for Image, *.ko, *.img under ${GITHUB_WORKSPACE}"
+          find "${GITHUB_WORKSPACE}" -type f \
+            \( -name 'Image' -o -name '*.ko' -o -name '*.img' \) \
+            -print | sort | tee "${ARTIFACT_DIR}/found-outputs.txt"
+
+          while IFS= read -r output_file; do
+            [ -n "${output_file}" ] || continue
+            relative_path="${output_file#${GITHUB_WORKSPACE}/}"
+            destination="${ARTIFACT_DIR}/${relative_path}"
+            mkdir -p "$(dirname "${destination}")"
+            cp -v "${output_file}" "${destination}"
+          done < "${ARTIFACT_DIR}/found-outputs.txt"
+
+          echo "Artifact directory:"
+          find "${ARTIFACT_DIR}" -type f -print | sort
+
+      - name: Upload kernel outputs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rodin-android15-6.6-sukisu-ultra-gki
+          path: artifacts/
+          if-no-files-found: warn
